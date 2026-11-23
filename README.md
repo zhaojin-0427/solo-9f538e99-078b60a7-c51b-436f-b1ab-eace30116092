@@ -4,6 +4,9 @@ FastAPI + SQLite 实现的停电单核查服务。联络开关切换后，台区
 因此**台区只有连不到任何电源才算失电**。服务按变位单自动核算各台区失电时段，
 并据此核查人工报停区间，列出**应补报**与**应剔除**的区间。
 
+配电班复盘时，还可按台区登记**户数台账**，并按复电时间范围输出复盘清单：
+每次停电的**完整时段、中断户秒与缺档秒数**。
+
 ## 固定拓扑
 
 启动时自动加载（首次启动写入 SQLite，幂等）：
@@ -57,6 +60,9 @@ uvicorn app.main:app --reload
 | DELETE | `/orders/{单号}` | **撤销**变位单 |
 | GET | `/loss-periods` | 查询已算好的台区失电时段（按范围裁剪） |
 | POST | `/verify` | **核查**：列出应补报与应剔除的区间 |
+| POST | `/households` | **登记 / 同刻更正**户数：台区 + UTC 生效时刻 + 非负整数户数 |
+| GET | `/households` | 查看台区户数台账（按生效时刻排序） |
+| GET | `/review` | **复盘清单**：每次停电的完整时段、中断户秒与缺档秒数 |
 
 ### 变位单规则
 
@@ -74,6 +80,20 @@ uvicorn app.main:app --reload
 - 直接用已算好的失电时段比对：
   - **应补报** = 失电时段 − 人工报停区间
   - **应剔除** = 人工报停区间 − 失电时段
+
+### 户数台账与复盘规则
+
+- **登记**：按台区和 UTC 生效时刻登记非负整数户数；**同刻再次提交即更正**（幂等）。
+- **沿用**：户数从所填时刻起沿用到下一笔；**首笔之前算缺档**，登记为零就按零户（不算缺档）。
+- **复盘查询**（`GET /review`）：按台区和 UTC **复电时间范围**查询（起点计入、终点不计），
+  从已有失电数据中选**有终点（已复电）**的时段，返回：
+  - `start` / `end`：**整段起止**（不按查询范围裁剪）；
+  - `household_seconds`：**中断户秒** = 各期有记录的户数 × 相应失电秒数，累加；
+  - `missing_seconds`：**缺档秒数** = 首笔台账生效之前的失电时长。
+- 变位单补改或撤销后，被拆分、合并或重新变为未复电的旧段**自动从清单撤下**
+  （清单即查即算，始终基于当前已提交的失电时段）。
+- 一次复盘查询固定在**同一个已提交状态**上（WAL 读快照）；写入失败整体回滚，
+  继续按已提交的数据查询。
 
 ## 示例：联络开关转供
 
@@ -106,6 +126,30 @@ curl -X POST localhost:8000/verify -H 'Content-Type: application/json' -d '{
 }
 ```
 
+## 示例：复盘清单
+
+```bash
+# 1) 登记户数台账：09:00 起 100 户，10:30 起更正为 50 户
+curl -X POST localhost:8000/households -H 'Content-Type: application/json' -d '{
+  "area_id": "T1", "effective_time": "2026-11-23T09:00:00Z", "households": 100}'
+curl -X POST localhost:8000/households -H 'Content-Type: application/json' -d '{
+  "area_id": "T1", "effective_time": "2026-11-23T10:30:00Z", "households": 50}'
+
+# 2) 复盘：复电时刻落在 11-23 全天的 T1 停电
+curl "localhost:8000/review?area_id=T1&start=2026-11-23T00:00:00Z&end=2026-11-24T00:00:00Z"
+```
+
+返回（失电时段 [10:00, 10:05)：100×300 户秒，无缺档）：
+
+```json
+{
+  "periods": [{
+    "start": "...T10:00:00.000000Z", "end": "...T10:05:00.000000Z",
+    "household_seconds": 30000, "missing_seconds": 0
+  }]
+}
+```
+
 ## 增量重算设计
 
 - `switch_segments` 物化各开关状态时间轴，定位任意时刻（含段首）状态只需
@@ -117,15 +161,27 @@ curl -X POST localhost:8000/verify -H 'Content-Type: application/json' -d '{
 - 重算按 epoch（相邻变位时刻之间）推进，每 epoch 用并查集判定各台区是否
   连到至少一路电源，结果写回 `loss_periods`。
 
+## 户秒累计积分设计
+
+- `household_records` 在每户数台账上物化该生效时刻的**累计户秒** `cum`
+  （首笔为 0），即户数为阶梯函数的积分 F(t)。
+- **查清单**：每段失电的中断户秒 = F(终点) − F(起点)，两次索引点查即可，
+  **无需逐条扫描失电期间的户数记录**；缺档秒数由首笔生效时刻直接得出。
+- **补改户数**：本笔有效期 `[t, 下一笔)` 内户数变化 Δc，只需把之后各笔的
+  `cum` 平移 Δc × 有效期秒数（一条 UPDATE），**完全不翻查失电记录**。
+- 复盘清单即查即算，始终基于当前已提交的 `loss_periods` 与台账；
+  一次查询用 `read_snapshot` 固定在同一个已提交状态上。
+
 ## 目录结构
 
 ```
 app/
   main.py       FastAPI 路由与请求模型
-  core.py       变位时间轴、增量重算、核查比对
-  db.py         SQLite 连接、建表、写事务
+  core.py       变位时间轴、增量重算、核查比对、户数台账与复盘清单
+  db.py         SQLite 连接、建表、写事务与读快照
   topology.py   固定拓扑种子数据
 tests/
-  test_core.py  单元 / 端到端测试（含增量重算与暴力全量重算对照）
+  test_core.py       变位单 / 核查测试（含增量重算与暴力全量重算对照）
+  test_households.py 户数台账与复盘清单测试（含累计积分与逐条扫描对照）
 Dockerfile、docker-compose.yml、requirements*.txt
 ```

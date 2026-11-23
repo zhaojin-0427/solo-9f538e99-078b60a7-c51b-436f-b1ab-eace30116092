@@ -1,6 +1,7 @@
 """停电单核查 API（FastAPI + SQLite）。
 
-打开 /docs 即可按单号补录、更正或撤销开关变位，并对人工报停区间做核查。
+打开 /docs 即可按单号补录、更正或撤销开关变位，对人工报停区间做核查，
+并按台区登记户数台账、输出配电班复盘清单（每次停电的中断户秒与缺档秒数）。
 """
 from __future__ import annotations
 
@@ -14,7 +15,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from . import core
-from .db import init_db, read_conn, write_txn
+from .db import init_db, read_conn, read_snapshot, write_txn
 from .topology import seed_topology
 
 
@@ -34,9 +35,11 @@ app = FastAPI(
         "- 同一开关同一时刻已有另一张单时拒绝提交；同刻变位一起核算；\n"
         "- 台区连不到任何电源才算失电（联络开关转供后不算失电）；\n"
         "- 核查时填台区、时间范围和人工报停区间（起点计入、终点不计），"
-        "直接列出应补报与应剔除的区间。"
+        "直接列出应补报与应剔除的区间；\n"
+        "- 按台区和 UTC 生效时刻登记非负整数户数（同刻可更正），"
+        "复盘时按复电时间范围列出每次停电的完整时段、中断户秒与缺档秒数。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -100,6 +103,18 @@ class VerifyRequest(BaseModel):
     )
     reported: list[ReportedInterval] = Field(
         default_factory=list, description="人工报停区间列表（起点计入、终点不计）"
+    )
+
+
+class HouseholdEntry(BaseModel):
+    """登记户数：按台区和 UTC 生效时刻填写非负整数户数；同刻再次提交即更正。"""
+
+    area_id: str = Field(..., description="台区号", examples=["T1"])
+    effective_time: datetime = Field(
+        ..., description="生效时刻（UTC，ISO 8601）", examples=["2026-11-23T08:00:00Z"]
+    )
+    households: int = Field(
+        ..., ge=0, description="户数（非负整数；登记为零就按零户）", examples=[120]
     )
 
 
@@ -264,6 +279,74 @@ def delete_order(order_no: str):
         spans = core.delete_order(conn, order_no)
         loss = core.loss_in_spans(conn, spans)
     return {"deleted": order_no, **_op_result(spans, loss)}
+
+
+# ------------------------------------------------------------ 户数台账与复盘
+
+@app.post("/households", tags=["户数台账"], summary="登记 / 同刻更正户数")
+def register_households(body: HouseholdEntry):
+    """按台区和 UTC 生效时刻登记非负整数户数；同刻再次提交即更正（幂等）。
+
+    户数从生效时刻起沿用到下一笔，首笔之前算缺档，登记为零就按零户。
+    只维护台账自身的累计户秒，不翻查任何失电记录；失败回滚，已提交数据不变。
+    """
+    t = core.to_epoch(body.effective_time)
+    with write_txn() as conn:
+        created, valid_until = core.upsert_households(
+            conn, body.area_id, t, body.households
+        )
+    return {
+        "area_id": body.area_id,
+        "effective_time": core.to_iso(t),
+        "households": body.households,
+        "created": created,
+        "valid_until": core.to_iso(valid_until),
+    }
+
+
+@app.get("/households", tags=["户数台账"], summary="查看台区户数台账")
+def list_households(area_id: str = Query(..., description="台区号", examples=["T1"])):
+    """户数台账：每笔记录从生效时刻沿用到下一笔，首笔之前算缺档。"""
+    with read_conn() as conn:
+        records = core.list_household_records(conn, area_id)
+    return {
+        "area_id": area_id,
+        "records": [
+            {"effective_time": core.to_iso(t), "households": h} for t, h in records
+        ],
+    }
+
+
+@app.get(
+    "/review",
+    tags=["复盘"],
+    summary="配电班复盘清单：每次停电的完整时段、中断户秒与缺档秒数",
+)
+def get_review(
+    area_id: str = Query(..., description="台区号", examples=["T1"]),
+    start: datetime = Query(..., description="复电时间范围起点（计入）"),
+    end: datetime = Query(..., description="复电时间范围终点（不计）"),
+):
+    """从已有失电数据中选有终点（已复电）的时段，复电时刻落在 [start, end) 内。
+
+    返回整段起止、中断户秒和缺档秒数；整个查询固定在同一个已提交状态上。
+    """
+    rs, re_ = core.to_epoch(start), core.to_epoch(end)
+    with read_snapshot() as conn:
+        items = core.review_loss_periods(conn, area_id, rs, re_)
+    return {
+        "area_id": area_id,
+        "range": {"start": core.to_iso(rs), "end": core.to_iso(re_)},
+        "periods": [
+            {
+                "start": core.to_iso(s),
+                "end": core.to_iso(e),
+                "household_seconds": core.stat_json(hs),
+                "missing_seconds": core.stat_json(gap),
+            }
+            for s, e, hs, gap in items
+        ],
+    }
 
 
 # ------------------------------------------------------------ 失电时段与核查

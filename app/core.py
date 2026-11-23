@@ -56,6 +56,12 @@ def interval_json(start: float, end: Optional[float]) -> dict:
     return {"start": to_iso(start), "end": to_iso(end)}
 
 
+def stat_json(x: float):
+    """户秒 / 秒数输出：按微秒取整，整数值以 int 返回。"""
+    r = round(x, 6)
+    return int(r) if r == int(r) else r
+
+
 # ------------------------------------------------------------ 区间集合运算
 
 def merge_intervals(intervals):
@@ -371,6 +377,130 @@ def delete_order(conn, order_no):
         raise NotFoundError(f"变位单 {order_no} 不存在")
     conn.execute("DELETE FROM orders WHERE order_no = ?", (order_no,))
     return recompute_spans(conn, [apply_revoke(conn, row[0], row[1])])
+
+
+# ------------------------------------------------------------ 户数台账
+
+def _ensure_area(conn, area_id):
+    if conn.execute(
+        "SELECT 1 FROM areas WHERE area_id = ?", (area_id,)
+    ).fetchone() is None:
+        raise ValidationError(f"台区 {area_id} 不存在")
+
+
+def upsert_households(conn, area_id, t, households):
+    """登记户数；同台区同一生效时刻再次提交即更正（须在写事务内调用）。
+
+    户数从生效时刻沿用到下一笔。只维护台账自身的累计户秒 cum：
+    本笔有效期 [t, 下一笔时刻) 内户数变化 Δc，会把之后各笔的 cum 平移
+    Δc × 有效期秒数（一条 UPDATE 完成），完全不翻查失电记录。
+
+    返回 (是否新登记, 下一笔生效时刻或 None)。
+    """
+    _ensure_area(conn, area_id)
+    if not isinstance(households, int) or households < 0:
+        raise ValidationError("户数必须是非负整数")
+    row = conn.execute(
+        "SELECT households FROM household_records "
+        "WHERE area_id = ? AND start_epoch = ?",
+        (area_id, t),
+    ).fetchone()
+    prev = conn.execute(
+        "SELECT start_epoch, households, cum FROM household_records "
+        "WHERE area_id = ? AND start_epoch < ? ORDER BY start_epoch DESC LIMIT 1",
+        (area_id, t),
+    ).fetchone()
+    nxt = conn.execute(
+        "SELECT start_epoch FROM household_records "
+        "WHERE area_id = ? AND start_epoch > ? ORDER BY start_epoch LIMIT 1",
+        (area_id, t),
+    ).fetchone()
+    t_next = nxt[0] if nxt is not None else None
+    if row is not None:  # 同刻更正
+        old = row[0]
+        if old == households:
+            return False, t_next  # 同值幂等 no-op
+        if t_next is not None:
+            conn.execute(
+                "UPDATE household_records SET cum = cum + ? "
+                "WHERE area_id = ? AND start_epoch > ?",
+                ((households - old) * (t_next - t), area_id, t),
+            )
+        conn.execute(
+            "UPDATE household_records SET households = ? "
+            "WHERE area_id = ? AND start_epoch = ?",
+            (households, area_id, t),
+        )
+        return False, t_next
+    cum_t = prev[2] + prev[1] * (t - prev[0]) if prev is not None else 0.0
+    if t_next is not None:
+        c_prev = prev[1] if prev is not None else 0
+        conn.execute(
+            "UPDATE household_records SET cum = cum + ? "
+            "WHERE area_id = ? AND start_epoch > ?",
+            ((households - c_prev) * (t_next - t), area_id, t),
+        )
+    conn.execute(
+        "INSERT INTO household_records (area_id, start_epoch, households, cum) "
+        "VALUES (?, ?, ?, ?)",
+        (area_id, t, households, cum_t),
+    )
+    return True, t_next
+
+
+def household_cum_at(conn, area_id, t):
+    """F(t)：t 时刻的累计户秒（首笔之前为 0）。索引点查，无需扫描台账。"""
+    row = conn.execute(
+        "SELECT start_epoch, households, cum FROM household_records "
+        "WHERE area_id = ? AND start_epoch <= ? ORDER BY start_epoch DESC LIMIT 1",
+        (area_id, t),
+    ).fetchone()
+    if row is None:
+        return 0.0
+    return row[2] + row[1] * (t - row[0])
+
+
+def list_household_records(conn, area_id):
+    """台区户数台账，按生效时刻排序。"""
+    _ensure_area(conn, area_id)
+    rows = conn.execute(
+        "SELECT start_epoch, households FROM household_records "
+        "WHERE area_id = ? ORDER BY start_epoch",
+        (area_id,),
+    ).fetchall()
+    return [(r[0], r[1]) for r in rows]
+
+
+# ------------------------------------------------------------ 复盘清单
+
+def review_loss_periods(conn, area_id, rs, re_):
+    """复盘清单：复电时刻落在 [rs, re_)（起点计入、终点不计）且已有终点的失电时段。
+
+    每段返回 (整段起点, 整段终点, 中断户秒, 缺档秒数)：
+    - 中断户秒 = F(终点) − F(起点)，即各期有记录的户数乘相应失电秒数后累加；
+      每段只需两次索引点查，无需逐条扫描失电期间的户数记录；
+    - 缺档秒数 = 首笔台账生效之前的失电时长（登记为零的时段按零户，不算缺档）；
+    - 变位单补改或撤销后，被拆分、合并或重新变为未复电的旧段自然从清单撤下。
+    """
+    if not rs < re_:
+        raise ValidationError("时间范围起点必须早于终点")
+    _ensure_area(conn, area_id)
+    rows = conn.execute(
+        "SELECT start_epoch, end_epoch FROM loss_periods "
+        "WHERE area_id = ? AND end_epoch IS NOT NULL "
+        "AND end_epoch >= ? AND end_epoch < ? ORDER BY start_epoch",
+        (area_id, rs, re_),
+    ).fetchall()
+    first = conn.execute(
+        "SELECT MIN(start_epoch) FROM household_records WHERE area_id = ?",
+        (area_id,),
+    ).fetchone()[0]
+    out = []
+    for s, e in rows:
+        hs = household_cum_at(conn, area_id, e) - household_cum_at(conn, area_id, s)
+        gap = max(0.0, min(e, first) - s) if first is not None else e - s
+        out.append((s, e, hs, gap))
+    return out
 
 
 # ------------------------------------------------------------ 查询与核查

@@ -60,6 +60,19 @@ CREATE TABLE IF NOT EXISTS loss_periods (
     end_epoch   REAL
 );
 CREATE INDEX IF NOT EXISTS ix_loss_area_start ON loss_periods (area_id, start_epoch);
+
+-- 户数台账：按台区与 UTC 生效时刻登记的非负整数户数，同刻可更正（主键即生效时刻）。
+-- 户数从生效时刻沿用到下一笔，首笔之前算缺档，登记为零就按零户。
+-- cum 为该生效时刻的累计户秒 F(start_epoch)（首笔为 0）：任意时段户秒 =
+-- F(终点) − F(起点)，两次索引点查即可，无需逐条扫描失电期间的户数记录；
+-- 补改户数只需把后续各笔的 cum 平移一个常量，完全不翻查失电记录。
+CREATE TABLE IF NOT EXISTS household_records (
+    area_id     TEXT NOT NULL,
+    start_epoch REAL NOT NULL,              -- UTC 生效时刻（epoch 秒）
+    households  INTEGER NOT NULL CHECK (households >= 0),
+    cum         REAL NOT NULL,              -- 累计户秒 F(start_epoch)
+    PRIMARY KEY (area_id, start_epoch)
+);
 """
 
 _write_lock = threading.RLock()
@@ -96,6 +109,25 @@ def read_conn():
     conn = connect()
     try:
         yield conn
+    finally:
+        conn.close()
+
+
+@contextmanager
+def read_snapshot():
+    """读快照：一次查询固定使用同一个已提交状态。
+
+    WAL 下读事务自持快照，并发写入不影响本次查询；写入失败回滚后，
+    这里读到的仍是已提交的数据。
+    """
+    conn = connect()
+    try:
+        conn.execute("BEGIN")
+        yield conn
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
